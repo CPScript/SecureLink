@@ -31,8 +31,7 @@ A network encryption library implementing AES-256-GCM and ChaCha20-Poly1305 with
 sudo apt-get install libsodium-dev libssl-dev
 
 # Compile
-gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-    -fPIE -pie -lcrypto -lsodium -pthread -o securelink securelink.c
+gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -pie securelink.c -lcrypto -lsodium -pthread -o securelink
 ```
 
 ## Quick Start
