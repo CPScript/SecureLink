@@ -1,8 +1,7 @@
 /*
- * Secure Network Encryption Module - Production Implementation
- * Uses AES-256-GCM with secure memory handling and constant-time operations
+ * Secure Network Encryption Module ~
  * Compile with: gcc -O2 -Wall -Wextra -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
- *               -fPIE -pie -lcrypto -lsodium -pthread -o securelink securelink.c
+ *               -fPIE -pie securelink.c -lsodium -lcrypto -pthread -o securelink
  */
 
 #define _GNU_SOURCE
@@ -180,8 +179,8 @@ static crypto_error_t crypto_init(void) {
         g_sodium_initialized = true;
     }
     
-    /* Initialize OpenSSL */
-    OpenSSL_add_all_algorithms();
+    /* Initialize OpenSSL - use newer function for OpenSSL 1.1.0+ */
+    OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS | OPENSSL_INIT_ADD_ALL_DIGESTS, NULL);
     
     pthread_mutex_unlock(&g_init_mutex);
     return CRYPTO_SUCCESS;
@@ -248,6 +247,11 @@ static replay_guard_t* replay_guard_create(size_t window_size) {
         return NULL;
     }
     
+    /* Initialize window with impossible sequence numbers */
+    for (size_t i = 0; i < window_size; i++) {
+        guard->window[i] = UINT64_MAX;
+    }
+    
     guard->window_size = window_size;
     guard->last_seq = 0;
     pthread_mutex_init(&guard->lock, NULL);
@@ -259,8 +263,8 @@ static replay_guard_t* replay_guard_create(size_t window_size) {
 static bool replay_guard_check(replay_guard_t *guard, uint64_t seq) {
     pthread_mutex_lock(&guard->lock);
     
-    /* Check if sequence number is too old */
-    if (seq <= guard->last_seq - guard->window_size) {
+    /* Check if sequence number is too old (avoid underflow) */
+    if (guard->last_seq >= guard->window_size && seq <= guard->last_seq - guard->window_size) {
         pthread_mutex_unlock(&guard->lock);
         return false;
     }
@@ -337,10 +341,8 @@ static crypto_context_t* context_create(const uint8_t *session_id,
     return ctx;
 }
 
-/* Rotate keys for forward secrecy */
-static crypto_error_t rotate_keys(crypto_context_t *ctx) {
-    pthread_mutex_lock(&ctx->lock);
-    
+/* Internal key rotation without mutex (assumes caller holds lock) */
+static crypto_error_t rotate_keys_unlocked(crypto_context_t *ctx) {
     uint8_t new_key[KEY_SIZE];
     uint8_t info[32];
     
@@ -352,8 +354,8 @@ static crypto_error_t rotate_keys(crypto_context_t *ctx) {
                                    ctx->salt, SALT_SIZE,
                                    info, strlen((char*)info),
                                    new_key, KEY_SIZE);
+    
     if (err != CRYPTO_SUCCESS) {
-        pthread_mutex_unlock(&ctx->lock);
         return err;
     }
     
@@ -371,7 +373,6 @@ static crypto_error_t rotate_keys(crypto_context_t *ctx) {
     ctx->packet_count = 0;
     ctx->last_rotation = time(NULL);
     
-    pthread_mutex_unlock(&ctx->lock);
     return CRYPTO_SUCCESS;
 }
 
@@ -400,7 +401,6 @@ static crypto_error_t aes_gcm_encrypt(const uint8_t *key,
                                      uint8_t *tag) {
     EVP_CIPHER_CTX *ctx;
     int len;
-    int ciphertext_len;
     
     /* Create and initialize context */
     if (!(ctx = EVP_CIPHER_CTX_new())) {
@@ -438,7 +438,6 @@ static crypto_error_t aes_gcm_encrypt(const uint8_t *key,
         EVP_CIPHER_CTX_free(ctx);
         return CRYPTO_ERR_ENCRYPT;
     }
-    ciphertext_len = len;
     
     /* Finalize encryption */
     if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
@@ -529,19 +528,26 @@ static crypto_error_t chacha20_poly1305_encrypt(const uint8_t *key,
                                                const uint8_t *aad, size_t aad_len,
                                                uint8_t *ciphertext,
                                                uint8_t *tag) {
+    /* Allocate temporary buffer for ciphertext+tag output */
+    uint8_t *temp_output = malloc(plaintext_len + TAG_SIZE);
+    if (!temp_output) return CRYPTO_ERR_ALLOC;
+    
     unsigned long long ciphertext_len;
     
     if (crypto_aead_chacha20poly1305_ietf_encrypt(
-            ciphertext, &ciphertext_len,
+            temp_output, &ciphertext_len,
             plaintext, plaintext_len,
             aad, aad_len,
             NULL, nonce, key) != 0) {
+        free(temp_output);
         return CRYPTO_ERR_ENCRYPT;
     }
     
-    /* Extract tag from end of ciphertext */
-    memcpy(tag, ciphertext + plaintext_len, TAG_SIZE);
+    /* Extract ciphertext and tag separately */
+    memcpy(ciphertext, temp_output, plaintext_len);
+    memcpy(tag, temp_output + plaintext_len, TAG_SIZE);
     
+    free(temp_output);
     return CRYPTO_SUCCESS;
 }
 
@@ -669,11 +675,23 @@ static void obfuscator_free(obfuscator_t *obf) {
 crypto_error_t encrypt_packet(crypto_context_t *ctx,
                             const uint8_t *plaintext, size_t plaintext_len,
                             uint8_t **ciphertext_out, size_t *ciphertext_len_out) {
+    if (!ctx || !plaintext || !ciphertext_out || !ciphertext_len_out || plaintext_len == 0) {
+        return CRYPTO_ERR_INVALID_PARAM;
+    }
+    
+    /* Initialize output parameters */
+    *ciphertext_out = NULL;
+    *ciphertext_len_out = 0;
+    
     pthread_mutex_lock(&ctx->lock);
     
     /* Check for key rotation */
     if (ctx->packet_count >= KEY_ROTATION_INTERVAL) {
-        rotate_keys(ctx);
+        crypto_error_t rot_err = rotate_keys_unlocked(ctx);
+        if (rot_err != CRYPTO_SUCCESS) {
+            pthread_mutex_unlock(&ctx->lock);
+            return rot_err;
+        }
     }
     
     /* Generate IV/nonce */
@@ -718,7 +736,6 @@ crypto_error_t encrypt_packet(crypto_context_t *ctx,
                                     plaintext, plaintext_len,
                                     aad, sizeof(aad),
                                     packet + 1 + 8 + IV_SIZE, tag);
-    }
     } else {
         free(packet);
         pthread_mutex_unlock(&ctx->lock);
@@ -751,6 +768,14 @@ crypto_error_t encrypt_packet(crypto_context_t *ctx,
 crypto_error_t decrypt_packet(crypto_context_t *ctx,
                             const uint8_t *ciphertext, size_t ciphertext_len,
                             uint8_t **plaintext_out, size_t *plaintext_len_out) {
+    if (!ctx || !ciphertext || !plaintext_out || !plaintext_len_out || ciphertext_len == 0) {
+        return CRYPTO_ERR_INVALID_PARAM;
+    }
+    
+    /* Initialize output parameters */
+    *plaintext_out = NULL;
+    *plaintext_len_out = 0;
+    
     pthread_mutex_lock(&ctx->lock);
     
     /* Validate packet size */
@@ -1176,9 +1201,10 @@ void run_tests(void) {
     crypto_error_t err = encrypt_packet(ctx, 
                                        (uint8_t*)test_msg, strlen(test_msg),
                                        &encrypted, &encrypted_len);
+    
     if (err == CRYPTO_SUCCESS) {
-        uint8_t *decrypted;
-        size_t decrypted_len;
+        uint8_t *decrypted = NULL;
+        size_t decrypted_len = 0;
         
         err = decrypt_packet(ctx, encrypted, encrypted_len,
                            &decrypted, &decrypted_len);
@@ -1188,12 +1214,17 @@ void run_tests(void) {
             memcmp(decrypted, test_msg, decrypted_len) == 0) {
             printf("PASSED: Encryption/Decryption successful\n");
         } else {
-            printf("FAILED: Decryption error or mismatch\n");
+            if (err == CRYPTO_SUCCESS) {
+                printf("FAILED: Data mismatch (len=%zu vs %zu)\n", 
+                       decrypted_len, strlen(test_msg));
+            } else {
+                printf("FAILED: Decryption error (err=%d)\n", err);
+            }
         }
         
         if (decrypted) free(decrypted);
     } else {
-        printf("FAILED: Encryption error\n");
+        printf("FAILED: Encryption error (%d)\n", err);
     }
     
     if (encrypted) free(encrypted);
@@ -1208,10 +1239,14 @@ void run_tests(void) {
     
     err = encrypt_packet(ctx, (uint8_t*)"test", 4, &encrypted, &encrypted_len);
     
-    if (!constant_time_compare(old_key, ctx->current_key, KEY_SIZE)) {
-        printf("PASSED: Keys rotated successfully\n");
+    if (err == CRYPTO_SUCCESS) {
+        if (!constant_time_compare(old_key, ctx->current_key, KEY_SIZE)) {
+            printf("PASSED: Keys rotated successfully\n");
+        } else {
+            printf("FAILED: Keys did not rotate\n");
+        }
     } else {
-        printf("FAILED: Keys did not rotate\n");
+        printf("FAILED: Encryption during key rotation failed (err=%d)\n", err);
     }
     
     if (encrypted) free(encrypted);
@@ -1402,6 +1437,9 @@ void run_tests(void) {
 }
 
 int main(int argc, char *argv[]) {
+    (void)argc; /* Suppress unused parameter warning */
+    (void)argv; /* Suppress unused parameter warning */
+    
     printf("Secure Network Encryption Module v2.0\n");
     printf("Using AES-256-GCM and ChaCha20-Poly1305\n\n");
     
