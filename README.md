@@ -135,6 +135,9 @@ int main() {
 # Throughput: ~XXX MB/s depending on hardware
 ```
 
+<img width="687" height="624" alt="image" src="https://github.com/user-attachments/assets/8433035e-cb49-48fb-9b76-cea88e20f64b" />
+
+
 ## Use Cases
 
 - **Custom VPN implementations**
